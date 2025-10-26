@@ -25,7 +25,7 @@ namespace hal_audio{
     };
 
     class AudioSensor {
-
+        public:
         virtual ~AudioSensor() = default;
 
         // Initialize the audio sensor
