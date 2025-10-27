@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 namespace hal_audio{
 
@@ -35,7 +36,7 @@ namespace hal_audio{
         virtual AudioStatus start() = 0;
         
         // Read audio samples (blocking or timeout-based)
-        virtual AudioStatus read(int32_t* buffer, size_t samples, size_t* bytes_read, uint32_t timeout_ms = 1000) = 0;
+        virtual AudioStatus read(std::vector<int32_t>* buffer, size_t samples, size_t* bytes_read, uint32_t timeout_ms = 1000) = 0;
         
         // Stop capturing audio
         virtual AudioStatus stop() = 0;
