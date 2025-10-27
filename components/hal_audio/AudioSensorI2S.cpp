@@ -13,13 +13,13 @@ namespace hal_audio
 
     class AudioSensorI2S : public AudioSensor{
         private:
-            i2s_chan_handle_t rx_handle;
+            i2s_chan_handle_t rx_handle_;
             AudioConfig config_;
             bool initialized_;
             bool running_;
         public:
             AudioSensorI2S()
-            :rx_handle(nullptr)
+            :rx_handle_(nullptr)
             ,initialized_(true)
             ,running_(false)
             {
@@ -27,6 +27,7 @@ namespace hal_audio
             }
 
             ~AudioSensorI2S() override{
+                delete TAG;
                 deinit();
             }
 
@@ -43,7 +44,7 @@ namespace hal_audio
                 chan_cfg.dma_desc_num = config.dma_buffer_count;
                 chan_cfg.dma_frame_num = config.dma_buffer_len;
 
-                esp_err_t ret = i2s_new_channel(&chan_cfg, nullptr, &rx_handle);
+                esp_err_t ret = i2s_new_channel(&chan_cfg, nullptr, &rx_handle_);
 
                 if( ret != ESP_OK)
                 {
@@ -73,7 +74,7 @@ namespace hal_audio
                     }
                 };
 
-                ret = i2s_channel_init_std_mode(rx_handle, &std_cfg);
+                ret = i2s_channel_init_std_mode(rx_handle_, &std_cfg);
                 if(ret != ESP_OK)
                 {
                     ESP_LOGE(TAG, "Failed to initialize std mode : %s", esp_err_to_name(ret));
@@ -88,7 +89,101 @@ namespace hal_audio
 
             }
 
-            
+            AudioStatus start() override{
+
+                if(!initialized_)
+                {
+                    return AudioStatus::NOT_INITIALIZED;
+                }
+
+                if(running_)
+                {
+                    return AudioStatus::OK;
+                }
+
+                esp_err_t ret = i2s_channel_enable(rx_handle_);
+                if(ret = !ESP_OK)
+                {
+                    ESP_LOGE(TAG,"Failed to enable I2S channel: %s", esp_err_to_name(ret));
+                    return AudioStatus::ERROR_START;
+                }
+
+                running_ = true;
+                ESP_LOGI(TAG, "I2S STARTED");
+                return AudioStatus::OK;
+            }
+
+            AudioStatus read(std::vector<int32_t>* buffer, size_t samples, size_t* bytes_read, uint32_t timeout_ms = 1000) override{
+                if(!initialized_ || !running_)
+                {
+                    return AudioStatus::NOT_INITIALIZED;
+                }
+
+                size_t bytes_to_read = samples* sizeof(int32_t);
+                esp_err_t ret = i2s_channel_read(rx_handle_,buffer,bytes_to_read, bytes_read,pdMS_TO_TICKS(timeout_ms));
+
+                if(ret != ESP_OK)
+                {
+                        ESP_LOGE(TAG, "Failed to read from I2S: %s", esp_err_to_name(ret));
+                        return AudioStatus::ERROR_READ;
+                }
+
+                return AudioStatus::OK;
+
+            }
+
+            AudioStatus stop() override{
+                if(!running_)
+                {
+                    return AudioStatus::OK;
+                }
+
+                esp_err_t ret = i2s_channel_disable(rx_handle_);
+
+                if(ret != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "Failed in stoping I2S channel: %s",esp_err_to_name(ret));
+                    return AudioStatus::ERROR_STOP;
+                }
+
+                running_ = false;
+                ESP_LOGI(TAG,"I2S stopped");
+                return AudioStatus::OK;
+            }
+
+            AudioStatus deinit() override{
+
+                if (!initialized_) {
+                    return AudioStatus::OK;
+                }
+                
+                if (running_) {
+                    stop();
+                }
+                
+                if (rx_handle_) {
+                    i2s_del_channel(rx_handle_);
+                    rx_handle_ = nullptr;
+                }
+                
+                initialized_ = false;
+                ESP_LOGI(TAG, "I2S deinitialized");
+                return AudioStatus::OK;
+            }
+
+            const AudioConfig& getConfig() const override{
+
+                return config_;
+            }
+
+            bool isInitialized() const override{
+                return initialized_;
+                
+            }
     };
+    // Factory function
+    AudioSensor* createI2SAudioSensor() {
+    return new AudioSensorI2S();
+    }
 
 } // namespace hal_audio
