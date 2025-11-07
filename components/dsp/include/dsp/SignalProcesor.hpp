@@ -84,4 +84,6 @@ public:
                             float threshold = 0.95f) const = 0;
 };
 
+SignalProcessor* createSignalProcessor();
+
 } // namespace dsp

@@ -50,4 +50,6 @@ namespace hal_audio{
         // Check if sensor is initialized
         virtual bool isInitialized() const = 0;
     };
+
+    AudioSensor* createI2SAudioSensor();
 }

@@ -71,7 +71,7 @@ public:
     ProcessStatus init(const DSPConfig& config) override {
         if (config.sample_rate == 0) {
             
-            //ESP_LOGE(TAG, "Invalid sample rate");
+            ESP_LOGE(TAG, "Invalid sample rate");
             return ProcessStatus::ERROR_SAMPLE_RATE;
         }
         
