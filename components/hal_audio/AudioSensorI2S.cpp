@@ -20,14 +20,14 @@ namespace hal_audio
         public:
             AudioSensorI2S()
             :rx_handle_(nullptr)
-            ,initialized_(true)
+            ,initialized_(false)//se cambio para evitar error de inicializacion doble
             ,running_(false)
             {
                 std::memset(&config_, 0, sizeof(config_));
             }
 
             ~AudioSensorI2S() override{
-                delete TAG;
+                //delete TAG;
                 deinit();
             }
 
@@ -102,7 +102,7 @@ namespace hal_audio
                 }
 
                 esp_err_t ret = i2s_channel_enable(rx_handle_);
-                if(ret = !ESP_OK)
+                if(ret != ESP_OK)
                 {
                     ESP_LOGE(TAG,"Failed to enable I2S channel: %s", esp_err_to_name(ret));
                     return AudioStatus::ERROR_START;
@@ -119,13 +119,19 @@ namespace hal_audio
                     return AudioStatus::NOT_INITIALIZED;
                 }
 
+                buffer->resize(samples);//ensure buffer is large enough
+
                 size_t bytes_to_read = samples* sizeof(int32_t);
-                esp_err_t ret = i2s_channel_read(rx_handle_,buffer,bytes_to_read, bytes_read,pdMS_TO_TICKS(timeout_ms));
+                esp_err_t ret = i2s_channel_read(rx_handle_,
+                                                buffer,
+                                                bytes_to_read,
+                                                bytes_read,
+                                                pdMS_TO_TICKS(timeout_ms));
 
                 if(ret != ESP_OK)
                 {
-                        ESP_LOGE(TAG, "Failed to read from I2S: %s", esp_err_to_name(ret));
-                        return AudioStatus::ERROR_READ;
+                    ESP_LOGE(TAG, "Failed to read from I2S: %s", esp_err_to_name(ret));
+                    return AudioStatus::ERROR_READ;
                 }
 
                 return AudioStatus::OK;
