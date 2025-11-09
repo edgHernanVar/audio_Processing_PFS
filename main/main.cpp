@@ -110,10 +110,11 @@ void audio_capture_task(void* pvParameters)
     int history_index = 0;
     
     // Thresholds for glass breaking
-    const float ONSET_THRESHOLD = 0.05f;      // Sudden increase
+    const float ONSET_THRESHOLD = 0.08f;      // Sudden increase NOTE: lowered from 0.2f because too sensitive
     const float PEAK_THRESHOLD = 0.15f;       // Peak during event
-    const float RATIO_THRESHOLD = 10.0f;      // RMS increase ratio
+    const float RATIO_THRESHOLD = 15.0f;      // RMS increase  // increased from 10.0f for better sensitivity
     
+
     uint32_t detection_cooldown = 0;
    
 
