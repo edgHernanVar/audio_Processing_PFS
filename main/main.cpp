@@ -83,13 +83,14 @@ void audio_capture_task(void* pvParameters)
     }
 
     const size_t frame_size = 512; //32ms at 16kHz
-    std::vector<int32_t> i2s_buffer(frame_size);
-    i2s_buffer.reserve((frame_size * 2)-1);//reserve extra space
+
+    std::vector<int32_t> i2s_buffer;
+    i2s_buffer.reserve(frame_size * 2);//reserve extra space
     i2s_buffer.resize(frame_size );//set initial size
 
     //pcm buffer after DSP processing
-    std::vector<int16_t> pcm_buffer(frame_size);
-    pcm_buffer.reserve((frame_size * 2)-1);//reserve extra space
+    std::vector<int16_t> pcm_buffer;
+    pcm_buffer.reserve(frame_size * 2);//reserve extra space
 
     ESP_LOGI(TAG, "Audio capture task started");
     ESP_LOGI(TAG, "I2S buffer: %d samples, PCM buffer capacity: %d", 
@@ -101,18 +102,29 @@ void audio_capture_task(void* pvParameters)
     
     while(true)
     {
+       
         // Read I2S data
         size_t bytes_read = 0;
+        
 
         hal_audio::AudioStatus status = sensor->read(
-            &i2s_buffer,
+            i2s_buffer.data(),
             frame_size,
             &bytes_read,
             1000 // 1 second timeout
         );
+        
 
-        if(status == hal_audio::AudioStatus::OK && bytes_read > 0)
-        {
+        if(status != hal_audio::AudioStatus::OK && bytes_read == 0){
+
+            ESP_LOGW(TAG, "No audio data read, status: %d", static_cast<int>(status));
+            vTaskDelay(pdMS_TO_TICKS(100)); // Retry reading
+
+        }else if(status == hal_audio::AudioStatus::OK && bytes_read > 0){
+
+            ESP_LOGD(TAG, "Read %d bytes from I2S AND STATUS OK", bytes_read);
+
+            //process I2S data through DSP
             size_t samples_read = bytes_read / sizeof(int32_t);
             //resize buffer to actual samples read
             i2s_buffer.resize(samples_read);
@@ -136,13 +148,14 @@ void audio_capture_task(void* pvParameters)
                         .timestamp = (uint64_t)esp_timer_get_time(),
                         .rms_energy = rms
                 };
-
+                /*
                 if(xQueueSend(audio_queue, &frame, 0) != pdTRUE)
                 {
                     ESP_LOGW(TAG, "Audio queue full, dropping frame");
                     //Restore pcm_buffer size for next read
                     //pcm_buffer = std::move(frame.samples);
                 }
+                */
 
                 if(++log_counter >= 50) //log every 50 frames
                 {
@@ -151,24 +164,25 @@ void audio_capture_task(void* pvParameters)
                 }
                 
             }
-            for(size_t i = 0; i < i2s_buffer.size(); ++i){
+
+            
+            
+            i2s_buffer.resize(frame_size); //reset buffer size for next read
+
+            // Optional: Add small delay if needed
+            vTaskDelay(pdMS_TO_TICKS(10));
+
+        }
+
+    }
+
+    for(size_t i = 0; i < i2s_buffer.size(); ++i){
 
                 //for debugging purposes in serial monitor
                 printf("%ld\n", i2s_buffer[i]);
                 //DELETE AFTER DEBUGGING AND TESTING
             }
             
-            i2s_buffer.resize(frame_size); //reset buffer size for next read
-
-        // Optional: Add small delay if needed
-         vTaskDelay(pdMS_TO_TICKS(10));
-
-        }else if (status != hal_audio::AudioStatus::OK){
-            ESP_LOGE(TAG, "Audio read error: %d", static_cast<int>(status));
-            vTaskDelay(pdMS_TO_TICKS(100)); // Delay before retrying
-        }
-
-    }
     delete dsp_processor;
     
     vTaskDelete(NULL);

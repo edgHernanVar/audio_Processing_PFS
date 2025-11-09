@@ -113,13 +113,13 @@ namespace hal_audio
                 return AudioStatus::OK;
             }
 
-            AudioStatus read(std::vector<int32_t>* buffer, size_t samples, size_t* bytes_read, uint32_t timeout_ms = 1000) override{
+            AudioStatus read(int32_t* buffer, size_t samples, size_t* bytes_read, uint32_t timeout_ms = 1000) override{
                 if(!initialized_ || !running_)
                 {
                     return AudioStatus::NOT_INITIALIZED;
                 }
 
-                buffer->resize(samples);//ensure buffer is large enough
+                //buffer->resize(samples);//ensure buffer is large enough
 
                 size_t bytes_to_read = samples* sizeof(int32_t);
                 esp_err_t ret = i2s_channel_read(rx_handle_,
