@@ -59,17 +59,24 @@ void audio_capture_task(void* pvParameters)
         return;
     }
 
-    //configure DSP for environmental sound processing
+    //configure DSP for Glass breaker application
     dsp::DSPConfig dsp_config {
         .sample_rate = 16000,//match I2S sample rate
         .enable_dc_removal = true,
-        .hpf_cutoff_hz = 50.0f,//set HPF cutoff
+        //remove low freq rumble(doors, steps)
+
+        .hpf_cutoff_hz = 200.0f, // Higher - glass breaking starts ~200 Hz
         .hpf_q = 0.707f,
-        .lpf_cutoff_hz = 7500.0f,//set LPF cutoff
+
+        //keep high freq (glass breaking is 2-15 kHz)
+        .lpf_cutoff_hz = 8000.0f, //Nyquist limit at 16kHz
         .lpf_q = 0.707f,
-        .pre_emphasis_alpha = 0.99f,//let the MFCC handle pre-emphasis
-        //in testing .99 to preserve more high freq
-        .target_gain_db = 6.0f, //Boost quiet sounds
+
+        //disable pre-emphasis here, MFCC will handle it
+        .pre_emphasis_alpha = 0.02f,//let the MFCC handle pre-emphasis
+
+        //moderate gain (don't over amplify noise)
+        .target_gain_db = 3.0f, //Boost quiet sounds
         .auto_normalize = false
     };
     
@@ -96,9 +103,10 @@ void audio_capture_task(void* pvParameters)
     ESP_LOGI(TAG, "I2S buffer: %d samples, PCM buffer capacity: %d", 
              i2s_buffer.size(), pcm_buffer.capacity());
 
-    //uint32_t frame_count = 0;
 
-    static int log_counter = 0;
+    uint32_t frame_count = 0;
+
+   
     
     while(true)
     {
@@ -115,7 +123,7 @@ void audio_capture_task(void* pvParameters)
         );
         
 
-        if(status != hal_audio::AudioStatus::OK && bytes_read == 0){
+        if(status != hal_audio::AudioStatus::OK || bytes_read == 0){
 
             ESP_LOGW(TAG, "No audio data read, status: %d", static_cast<int>(status));
             vTaskDelay(pdMS_TO_TICKS(100)); // Retry reading
@@ -138,11 +146,8 @@ void audio_capture_task(void* pvParameters)
             }else{
                 float rms = dsp_processor->calculateRMS(pcm_buffer);
 
-                if(dsp_processor->hasClipping(pcm_buffer))
-                {
-                    ESP_LOGW(TAG, "Clipping detected in audio frame");
-                }
-
+                
+                //for mfcc extraction task
                 AudioFrame frame{
                         .samples = pcm_buffer,
                         .timestamp = (uint64_t)esp_timer_get_time(),
@@ -157,10 +162,16 @@ void audio_capture_task(void* pvParameters)
                 }
                 */
 
-                if(++log_counter >= 50) //log every 50 frames
+                //check for clipping
+                if(dsp_processor->hasClipping(pcm_buffer))
                 {
-                    ESP_LOGI(TAG, "Captured audio frame: %d samples, RMS: %.4f", frame.samples.size(), frame.rms_energy);
-                    log_counter = 0;
+                    ESP_LOGW(TAG, "Clipping detected in audio frame");
+                }
+
+                //Periodic status log
+                if (++frame_count % 50 == 0) {
+                ESP_LOGI(TAG, "Frame %lu: %d samples, RMS: %.4f", 
+                         frame_count, pcm_buffer.size(), rms);
                 }
                 
             }
@@ -176,13 +187,8 @@ void audio_capture_task(void* pvParameters)
 
     }
 
-    for(size_t i = 0; i < i2s_buffer.size(); ++i){
+    
 
-                //for debugging purposes in serial monitor
-                printf("%ld\n", i2s_buffer[i]);
-                //DELETE AFTER DEBUGGING AND TESTING
-            }
-            
     delete dsp_processor;
     
     vTaskDelete(NULL);
