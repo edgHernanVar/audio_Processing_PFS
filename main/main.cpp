@@ -103,8 +103,19 @@ void audio_capture_task(void* pvParameters)
     ESP_LOGI(TAG, "I2S buffer: %d samples, PCM buffer capacity: %d", 
              i2s_buffer.size(), pcm_buffer.capacity());
 
-
+    // ✅ Detection variables
     uint32_t frame_count = 0;
+    float baseline_rms = 0.005f;      // Normal room noise level
+    float rms_history[10] = {0};      // Keep last 10 frames
+    int history_index = 0;
+    
+    // Thresholds for glass breaking
+    const float ONSET_THRESHOLD = 0.05f;      // Sudden increase
+    const float PEAK_THRESHOLD = 0.15f;       // Peak during event
+    const float RATIO_THRESHOLD = 10.0f;      // RMS increase ratio
+    
+    uint32_t detection_cooldown = 0;
+   
 
    
     
@@ -146,7 +157,56 @@ void audio_capture_task(void* pvParameters)
             }else{
                 float rms = dsp_processor->calculateRMS(pcm_buffer);
 
+                if(rms < baseline_rms * 2.0f)
+                {
+                    //Update baseline using moving average
+                    baseline_rms = 0.9f * baseline_rms + 0.1f * rms;
+                }
+
+                rms_history[history_index] = rms;
+                history_index = (history_index + 1) % 10;//using modulo for circular buffer
                 
+                
+                if(detection_cooldown > 0)
+                {
+                    detection_cooldown--;
+                }else{
+                    float rms_ratio = rms / (baseline_rms + 1e-3f);//lets first try with 3 digits
+
+                    //Check for sudden onset
+                    bool sudden_onset = (rms> ONSET_THRESHOLD) &&
+                                        (rms_ratio > RATIO_THRESHOLD);
+                    
+                    //Check for peak energy
+                    bool high_peak = (rms > PEAK_THRESHOLD);
+
+                    //calculate peak amplitude
+                    int16_t peak_amplitude = 0;
+                    for(auto sample : pcm_buffer)
+                    {
+                        if(std::abs(sample) > peak_amplitude)
+                        {
+                            peak_amplitude = std::abs(sample);
+                        }
+                    }
+
+                    if( sudden_onset || high_peak)
+                    {
+                        ESP_LOGW(TAG, "🔔 GLASS BREAKING DETECTED!");
+                        ESP_LOGI(TAG, "  RMS: %.4f (baseline: %.4f, ratio: %.1fx)", 
+                                rms, baseline_rms, rms_ratio);
+                        ESP_LOGI(TAG, "  Peak amplitude: %d", peak_amplitude);
+                        
+                        // TODO: Trigger full 1-second capture for MFCC analysis
+                        // TODO: Send to ML classifier
+                        
+                        // Cooldown to avoid multiple detections
+                        detection_cooldown = 50;  // ~800ms cooldown
+                    }
+
+                    
+                }
+
                 //for mfcc extraction task
                 AudioFrame frame{
                         .samples = pcm_buffer,
@@ -170,8 +230,8 @@ void audio_capture_task(void* pvParameters)
 
                 //Periodic status log
                 if (++frame_count % 50 == 0) {
-                ESP_LOGI(TAG, "Frame %lu: %d samples, RMS: %.4f", 
-                         frame_count, pcm_buffer.size(), rms);
+                    ESP_LOGI(TAG, "Frame %lu: RMS %.4f, Baseline %.4f, Peak/Base %.1fx", 
+                            frame_count, rms, baseline_rms, rms / (baseline_rms + 0.001f));
                 }
                 
             }
