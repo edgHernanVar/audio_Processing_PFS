@@ -1,5 +1,6 @@
 #include "hal_audio/AudioSensorI2S.hpp"
 #include "dsp/SignalProcesor.hpp"
+#include "features/FeatureExtractor.hpp"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -24,8 +25,20 @@ struct AudioFrame{
     float rms_energy;
 };
 
+struct PipelineConfig{
+    uint32_t sample_rate = 16000;
+    size_t capture_frames_ms = 32; //32ms frames for low latency
+    size_t inference_window_ms = 1000; //1 second analysis window   
+};
+
+struct FeatureFrame{
+    features::FeatureVector features;
+    uint64_t timestamp_us;
+};
+
 //global queue for inter-task communication
 static QueueHandle_t audio_queue = nullptr;
+static QueueHandle_t feature_queue = nullptr;
 //AudioSensor* createI2SAudioSensor();
 
 // Function to print memory information
@@ -195,10 +208,24 @@ void audio_capture_task(void* pvParameters)
                     {
                         ESP_LOGW(TAG, "🔔 GLASS BREAKING DETECTED!");
                         ESP_LOGI(TAG, "  RMS: %.4f (baseline: %.4f, ratio: %.1fx)", 
-                                rms, baseline_rms, rms_ratio);
+                                    rms, baseline_rms, rms_ratio);
                         ESP_LOGI(TAG, "  Peak amplitude: %d", peak_amplitude);
                         
                         // TODO: Trigger full 1-second capture for MFCC analysis
+                        
+                        AudioFrame frame{
+                        .samples = pcm_buffer,
+                        .timestamp = (uint64_t)esp_timer_get_time(),
+                        .rms_energy = rms
+                        };
+
+                        if(xQueueSend(audio_queue, &frame, 0) != pdTRUE)
+                        {
+                            ESP_LOGW(TAG, "Audio queue full, dropping frame");
+                            //Restore pcm_buffer size for next read
+                            //pcm_buffer = std::move(frame.samples);
+                        }
+                        
                         // TODO: Send to ML classifier
                         
                         // Cooldown to avoid multiple detections
@@ -209,19 +236,8 @@ void audio_capture_task(void* pvParameters)
                 }
 
                 //for mfcc extraction task
-                AudioFrame frame{
-                        .samples = pcm_buffer,
-                        .timestamp = (uint64_t)esp_timer_get_time(),
-                        .rms_energy = rms
-                };
-                /*
-                if(xQueueSend(audio_queue, &frame, 0) != pdTRUE)
-                {
-                    ESP_LOGW(TAG, "Audio queue full, dropping frame");
-                    //Restore pcm_buffer size for next read
-                    //pcm_buffer = std::move(frame.samples);
-                }
-                */
+                
+                
 
                 //check for clipping
                 if(dsp_processor->hasClipping(pcm_buffer))
@@ -255,61 +271,134 @@ void audio_capture_task(void* pvParameters)
     vTaskDelete(NULL);
 }
 
-void inference_task(void* pvParameters)
+//task 2 medium priority
+void feature_extraction_task(void* Pvparameters)
 {
-    ESP_LOGI(TAG, "Inference task started");
-    const size_t sample_rate = 16000;
-    const size_t window_size = sample_rate + 1; //1 second window
-    std::vector<int16_t> audio_window;
-    audio_window.reserve(window_size);
 
+    features::FeatureExtractor* mfcc = features::createMFCCExtractor();
+
+    //config MFCC
+    features::FeatureConfig mfcc_config = features::defaultEnvironmentFeatureConfig();
+    mfcc_config.lower_frequency_hz = 200.0f; //match DSP high-pass
+    mfcc_config.include_delta = true;
+    mfcc_config.include_delta_delta = true;
+
+    if(mfcc->init(mfcc_config) != features::FeatureStatus::OK)
+    {
+        ESP_LOGE(TAG, "Failed to initialize MFCC extractor");
+        vTaskDelete(NULL);
+        delete mfcc;
+        return;
+    }
+
+    const size_t window_size = 16000; //1 second at 16kHz
+    std::vector<int16_t> audio_window;
+    audio_window.reserve(window_size + 512); //extra space for overlap
+
+    ESP_LOGI(TAG, "Feature extraction task started");
     AudioFrame frame;
-    // Placeholder for inference logic
+    uint32_t inference_count = 0;
     while(true)
     {
-        AudioFrame frame;
         if(xQueueReceive(audio_queue, &frame, portMAX_DELAY) == pdTRUE)
         {
-            audio_window.insert(audio_window.end(),
-             frame.samples.begin(),
-             frame.samples.end()
-            );
-
-
-            if(audio_window.size() >= window_size)
+            const float VAD_THRESHOLD = 0.015f; //adjust as needed
+            
+            if(frame.rms_energy < VAD_THRESHOLD)
             {
-                // Perform inference on received audio frame
-                ESP_LOGI(TAG, "Processing %d samples for inference", audio_window.size());
-
-                float window_energy = 0.0f;
-                for(int16_t sample : audio_window)
+                if(!audio_window.empty())
                 {
-                    float normalized = sample / 32768.0f;
-                    window_energy += normalized * normalized;
+                    ESP_LOGD(TAG, "Silence detected, clearing audio window");
+                    audio_window.clear();
                 }
-
-                window_energy = std::sqrt(window_energy / audio_window.size());
-
-                const float VAD_THRESHOLD = 0.02f; //example threshold
-
-                if(window_energy > VAD_THRESHOLD)
+            }else{
+                audio_window.insert(
+                    audio_window.end(),
+                    frame.samples.begin(),
+                    frame.samples.end()
+                );
+                if(audio_window.size() >= window_size)
                 {
-                     ESP_LOGI(TAG, "Sound detected (energy: %.4f) - ready for MFCC extraction", 
-                             window_energy);
+                    audio_window.erase(
+                        audio_window.begin(),
+                        audio_window.begin() + (audio_window.size() - window_size)
+                    );
 
-                    // TODO: Pass to MFCC extractor
-                    // features::FeatureExtractor* extractor = ...
-                    // extractor->extract(audio_window);
+                    ESP_LOGI(TAG, "Performing MFCC extraction on %d samples", audio_window.size());
+                    features::FeatureVector feature_vector;
+                    features::FeatureStatus feat_status = mfcc->compute(audio_window, feature_vector);
+
+                    if(feat_status != features::FeatureStatus::OK)
+                    {
+                        ESP_LOGE(TAG, "MFCC extraction error: %d", static_cast<int>(feat_status));
+                    }else{
+
+                        ESP_LOGI(TAG, "Extracted %d frames x %d coeffs = %d features",
+                                 feature_vector.num_frames,
+                                 feature_vector.num_coefficients,
+                                 feature_vector.size());
+
+                        //send to next stage (classifier)
+                        FeatureFrame feat_frame{
+                            .features = std::move(feature_vector),
+                            .timestamp_us = (uint64_t)esp_timer_get_time()
+                        };
+
+                        if(xQueueSend(feature_queue, &feat_frame, 0) != pdTRUE)
+                        {
+                            ESP_LOGW(TAG, "Feature queue full, dropping frame");
+                        }else{
+                            inference_count++;
+                        }
+
+                        inference_count++;
+                        ESP_LOGI(TAG, "Completed inference %d", inference_count);   
+                    }
                     
-                    // TODO: Pass features to ML classifier
-                    // ml::Classifier* classifier = ...
-                    // classifier->classify(features);
-                    
-                }else{
-                    ESP_LOGI(TAG, "Silence (energy: %.4f)", window_energy);
-                }
-                audio_window.clear();
+                    audio_window.clear();
+                }   
             }
+        }
+    }
+
+    delete mfcc;
+    vTaskDelete(NULL);
+}
+
+void ml_inference_task(void* pvParameters) {
+    ESP_LOGI(TAG, "ML inference task started");
+    
+    // TODO: Initialize TensorFlow Lite Micro model
+    // ml::Classifier* classifier = createClassifier();
+    // classifier->init("model.tflite");
+    
+    FeatureFrame frame;
+    
+    while (true) {
+        if (xQueueReceive(feature_queue, &frame, portMAX_DELAY) == pdTRUE) {
+            
+            ESP_LOGI(TAG, "Running inference on %d features", frame.features.size());
+            
+            // TODO: Run ML inference
+            // auto result = classifier->classify(frame.features.data.data(),
+            //                                    frame.features.size());
+            
+            // For now, just log
+            ESP_LOGI(TAG, "Features shape: [%d, %d]",
+                     frame.features.num_frames,
+                     frame.features.num_coefficients);
+            
+            // Check quality
+            if (frame.features.contains_speech) {
+                ESP_LOGI(TAG, "Speech detected! Energy: mean=%.4f std=%.4f",
+                         frame.features.energy_mean,
+                         frame.features.energy_std);
+            }
+            
+            // Simulate inference time
+            vTaskDelay(pdMS_TO_TICKS(100));
+            
+            // TODO: Send results to event filter and publisher
         }
     }
     
@@ -366,12 +455,34 @@ void app_main(void)
         "audio_capture",
         8192,
         sensor,
-        5,
+        10,
         NULL,
         1
     );
 
     ESP_LOGI(TAG, "Audio Task created");
+    xTaskCreatePinnedToCore(
+        feature_extraction_task,
+        "mfcc_extract",
+        12288,
+        NULL,
+        6,   // Medium priority
+        NULL,
+        1
+    );
+    
+    xTaskCreatePinnedToCore(
+        ml_inference_task,
+        "ml_inference",
+        16384,
+        NULL,
+        3,   // Lower priority
+        NULL,
+        1
+    );
+    
+    ESP_LOGI(TAG, "Pipeline started successfully!");
+    ESP_LOGI(TAG, "Audio → DSP → MFCC → ML → Results");
 
     print_memory_info();        
 }

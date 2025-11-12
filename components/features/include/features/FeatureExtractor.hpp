@@ -144,4 +144,6 @@ public:
     virtual void reset() = 0;
 };
 
+    FeatureExtractor* createMFCCExtractor();
+    
 } // namespace features
