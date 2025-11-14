@@ -61,10 +61,10 @@ namespace hal_audio
                     ),
                     .gpio_cfg = {
                         .mclk = I2S_GPIO_UNUSED,
-                        .bclk = GPIO_NUM_4, //Bit clock (change to actual pin)
-                        .ws = GPIO_NUM_5, //word select (change to actual pin)
+                        .bclk = GPIO_NUM_4, //Bit clock (change to actual pin)/ SCk in sensor
+                        .ws = GPIO_NUM_5, //word select (change to actual pin)/ WS in sensor
                         .dout = I2S_GPIO_UNUSED, //we are not sending data
-                        .din = GPIO_NUM_6, //Data in (change to actual pin)
+                        .din = GPIO_NUM_6, //Data in (change to actual pin)/ SD in sensor
                         .invert_flags = {
                         .mclk_inv = false,
                         .bclk_inv = false,

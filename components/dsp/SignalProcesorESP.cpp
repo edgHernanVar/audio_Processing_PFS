@@ -274,7 +274,7 @@ public:
         }
         return false;
     }
-    
+        
 private:
     // Design biquad coefficients for 2nd-order Butterworth highpass
     void designHighpass(float fc, float Q, uint32_t fs, BiquadState& bq) {

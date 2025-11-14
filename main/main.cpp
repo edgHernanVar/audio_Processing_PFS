@@ -20,7 +20,7 @@ static const char* TAG = "MAIN";
 
 //Structure for passing audio data between tasks
 struct AudioFrame{
-    std::vector<int16_t> samples;
+    std::vector<int16_t>* samples;
     uint64_t timestamp;
     float rms_energy;
 };
@@ -32,7 +32,7 @@ struct PipelineConfig{
 };
 
 struct FeatureFrame{
-    features::FeatureVector features;
+    features::FeatureVector* features;
     uint64_t timestamp_us;
 };
 
@@ -112,6 +112,8 @@ void audio_capture_task(void* pvParameters)
     std::vector<int16_t> pcm_buffer;
     pcm_buffer.reserve(frame_size * 2);//reserve extra space
 
+    
+
     ESP_LOGI(TAG, "Audio capture task started");
     ESP_LOGI(TAG, "I2S buffer: %d samples, PCM buffer capacity: %d", 
              i2s_buffer.size(), pcm_buffer.capacity());
@@ -171,6 +173,8 @@ void audio_capture_task(void* pvParameters)
             }else{
                 float rms = dsp_processor->calculateRMS(pcm_buffer);
 
+                //if(rms <= 0.0001f){ ESP_LOGW(TAG,"RMS CAMPURING NOTHING");}
+
                 if(rms < baseline_rms * 2.0f)
                 {
                     //Update baseline using moving average
@@ -213,8 +217,8 @@ void audio_capture_task(void* pvParameters)
                         
                         // TODO: Trigger full 1-second capture for MFCC analysis
                         
-                        AudioFrame frame{
-                        .samples = pcm_buffer,
+                        AudioFrame* frame = new AudioFrame{
+                        .samples = new std::vector<int16_t>(pcm_buffer),
                         .timestamp = (uint64_t)esp_timer_get_time(),
                         .rms_energy = rms
                         };
@@ -223,7 +227,7 @@ void audio_capture_task(void* pvParameters)
                         {
                             ESP_LOGW(TAG, "Audio queue full, dropping frame");
                             //Restore pcm_buffer size for next read
-                            //pcm_buffer = std::move(frame.samples);
+                            //pcm_buffer = std::move(frame->samples);
                         }
                         
                         // TODO: Send to ML classifier
@@ -248,7 +252,7 @@ void audio_capture_task(void* pvParameters)
                 //Periodic status log
                 if (++frame_count % 50 == 0) {
                     ESP_LOGI(TAG, "Frame %lu: RMS %.4f, Baseline %.4f, Peak/Base %.1fx", 
-                            frame_count, rms, baseline_rms, rms / (baseline_rms + 0.001f));
+                                frame_count, rms, baseline_rms, rms / (baseline_rms + 0.001f));
                 }
                 
             }
@@ -296,7 +300,7 @@ void feature_extraction_task(void* Pvparameters)
     audio_window.reserve(window_size + 512); //extra space for overlap
 
     ESP_LOGI(TAG, "Feature extraction task started");
-    AudioFrame frame;
+    AudioFrame* frame = new AudioFrame();
     uint32_t inference_count = 0;
     while(true)
     {
@@ -304,7 +308,7 @@ void feature_extraction_task(void* Pvparameters)
         {
             const float VAD_THRESHOLD = 0.015f; //adjust as needed
             
-            if(frame.rms_energy < VAD_THRESHOLD)
+            if(frame->rms_energy < VAD_THRESHOLD)
             {
                 if(!audio_window.empty())
                 {
@@ -314,8 +318,8 @@ void feature_extraction_task(void* Pvparameters)
             }else{
                 audio_window.insert(
                     audio_window.end(),
-                    frame.samples.begin(),
-                    frame.samples.end()
+                    frame->samples->begin(),
+                    frame->samples->end()
                 );
                 if(audio_window.size() >= window_size)
                 {
@@ -340,7 +344,7 @@ void feature_extraction_task(void* Pvparameters)
 
                         //send to next stage (classifier)
                         FeatureFrame feat_frame{
-                            .features = std::move(feature_vector),
+                            .features = std::move(&feature_vector),
                             .timestamp_us = (uint64_t)esp_timer_get_time()
                         };
 
@@ -372,27 +376,27 @@ void ml_inference_task(void* pvParameters) {
     // ml::Classifier* classifier = createClassifier();
     // classifier->init("model.tflite");
     
-    FeatureFrame frame;
+    FeatureFrame* frame = new FeatureFrame();
     
     while (true) {
         if (xQueueReceive(feature_queue, &frame, portMAX_DELAY) == pdTRUE) {
-            
-            ESP_LOGI(TAG, "Running inference on %d features", frame.features.size());
-            
+
+            ESP_LOGI(TAG, "Running inference on %d features", frame->features->size());
+
             // TODO: Run ML inference
             // auto result = classifier->classify(frame.features.data.data(),
             //                                    frame.features.size());
             
             // For now, just log
             ESP_LOGI(TAG, "Features shape: [%d, %d]",
-                     frame.features.num_frames,
-                     frame.features.num_coefficients);
-            
+                     frame->features->num_frames,
+                     frame->features->num_coefficients);
+
             // Check quality
-            if (frame.features.contains_speech) {
+            if (frame->features->contains_speech) {
                 ESP_LOGI(TAG, "Speech detected! Energy: mean=%.4f std=%.4f",
-                         frame.features.energy_mean,
-                         frame.features.energy_std);
+                         frame->features->energy_mean,
+                         frame->features->energy_std);
             }
             
             // Simulate inference time
@@ -410,6 +414,16 @@ void app_main(void)
     ESP_LOGI(TAG, "Starting Audio catching");
 
     print_memory_info();
+
+    // ✅ CREATE QUEUES FIRST!
+    audio_queue = xQueueCreate(10, sizeof(AudioFrame));
+    feature_queue = xQueueCreate(5, sizeof(FeatureFrame));
+
+    if(!audio_queue || !feature_queue)
+    {
+        ESP_LOGE(TAG, "Failed to create queues");
+        return;
+    }
 
     hal_audio::AudioSensor* sensor = hal_audio::createI2SAudioSensor();
 
