@@ -1,6 +1,9 @@
 #include "hal_audio/AudioSensorI2S.hpp"
 #include "dsp/SignalProcesor.hpp"
 #include "features/FeatureExtractor.hpp"
+#include "net/Publisher.hpp"
+#include "ml/ClassifierTFLM.hpp"
+#include "ml/model_data.hpp"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -8,6 +11,7 @@
 #include <vector>
 #include <cmath>
 #include <stdio.h>
+#include <string.h>
 
 extern "C" 
 {   
@@ -17,6 +21,27 @@ extern "C"
 //using namespace hal_audio;
 
 static const char* TAG = "MAIN";
+
+// ======================== CONFIGURATION ========================
+
+// Device ID (change this for each device)
+#define DEVICE_ID "esp32s3_audio_001"
+
+// WiFi Credentials (Home and School)
+#define WIFI_SSID_HOME     "HUAWEI-11C1V7"
+#define WIFI_PASS_HOME     "WFH2704caman107"
+#define WIFI_SSID_SCHOOL   "UMx Dragon"
+#define WIFI_PASS_SCHOOL   "Dragones.UMx"
+
+// Server Configuration
+#define SERVER_URL         "https://pfsembebidos.com/api/ingests"
+#define SERVER_TIMEOUT_MS  5000
+#define SERVER_RETRY       3
+#define DEVICE_ID   "esp32s3_audio_001"
+#define DEVICE_KEY  "abc123456"
+
+
+// ======================== DATA STRUCTURES ========================
 
 //Structure for passing audio data between tasks
 struct AudioFrame{
@@ -36,9 +61,20 @@ struct FeatureFrame{
     uint64_t timestamp_us;
 };
 
+struct ClassificationFrame{
+    ml::ClassificationResult* result;
+    uint64_t timestamp_us;
+    float rms_energy;
+};
+    
+
 //global queue for inter-task communication
 static QueueHandle_t audio_queue = nullptr;
 static QueueHandle_t feature_queue = nullptr;
+static QueueHandle_t classification_queue = nullptr;
+
+static net::Publisher* publisher = nullptr;
+// ======================== FUNCTION DECLARATIONS ========================
 //AudioSensor* createI2SAudioSensor();
 
 // Function to print memory information
@@ -125,7 +161,7 @@ void audio_capture_task(void* pvParameters)
     int history_index = 0;
     
     // Thresholds for glass breaking
-    const float ONSET_THRESHOLD = 0.08f;      // Sudden increase NOTE: lowered from 0.2f because too sensitive
+    const float ONSET_THRESHOLD = 0.12f;      // Sudden increase NOTE: lowered from 0.2f because too sensitive
     const float PEAK_THRESHOLD = 0.15f;       // Peak during event
     const float RATIO_THRESHOLD = 15.0f;      // RMS increase  // increased from 10.0f for better sensitivity
     
@@ -283,9 +319,15 @@ void feature_extraction_task(void* Pvparameters)
 
     //config MFCC
     features::FeatureConfig mfcc_config = features::defaultEnvironmentFeatureConfig();
-    mfcc_config.lower_frequency_hz = 200.0f; //match DSP high-pass
+    mfcc_config.num_mel_bins = 128; //more mel bins for better resolution
+    mfcc_config.frame_length_ms = 128; //longer frame for glass break
+    mfcc_config.frame_stride_ms = 32; //50% overlap
+    mfcc_config.fft_length = 2048; //larger FFT for better freq resolution
+    mfcc_config.use_log_mel = true; //log-mel for better dynamic range
     mfcc_config.include_delta = true;
     mfcc_config.include_delta_delta = true;
+    mfcc_config.normalize_features = false; //disable normalization for glass break
+    mfcc_config.use_energy = true; //include energy coeff
 
     if(mfcc->init(mfcc_config) != features::FeatureStatus::OK)
     {
@@ -373,39 +415,186 @@ void ml_inference_task(void* pvParameters) {
     ESP_LOGI(TAG, "ML inference task started");
     
     // TODO: Initialize TensorFlow Lite Micro model
-    // ml::Classifier* classifier = createClassifier();
-    // classifier->init("model.tflite");
+    ml::Classifier* classifier = ml::createClassifier();
+    if (!classifier) {
+        ESP_LOGE(TAG, "Failed to create classifier");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    std::vector<std::string> labels;
+    for(uint8_t i = 0; i < num_classes; ++i) {
+        labels.push_back(std::string(class_labels[i]));
+    }
+
+    ESP_LOGI(TAG, "Loading TFLite model (%d bytes)...", glass_break_model_len);
+    
+    ml::ClassifierStatus init_status = classifier->init(glass_break_model, glass_break_model_len, labels);
+
+    if (init_status != ml::ClassifierStatus::OK) {
+        ESP_LOGE(TAG, "Classifier initialization failed: %d", 
+                 static_cast<int>(init_status));
+        delete classifier;
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "Classifier initialized successfully");
+
+    //get model info
+    ml::ModelInfo info = classifier->getModelInfo();
+    ESP_LOGI(TAG, "Model expects %d input features", info.input_size);
+    ESP_LOGI(TAG, "Model has %d output classes", info.output_size);
+
     
     FeatureFrame* frame = new FeatureFrame();
+    uint32_t inference_count = 0;
     
     while (true) {
         if (xQueueReceive(feature_queue, &frame, portMAX_DELAY) == pdTRUE) {
 
             ESP_LOGI(TAG, "Running inference on %d features", frame->features->size());
 
-            // TODO: Run ML inference
-            // auto result = classifier->classify(frame.features.data.data(),
-            //                                    frame.features.size());
-            
-            // For now, just log
-            ESP_LOGI(TAG, "Features shape: [%d, %d]",
+            ESP_LOGI(TAG, "Feature shape: [%d frames, %d coeffs] = %d total",
                      frame->features->num_frames,
-                     frame->features->num_coefficients);
-
-            // Check quality
-            if (frame->features->contains_speech) {
-                ESP_LOGI(TAG, "Speech detected! Energy: mean=%.4f std=%.4f",
-                         frame->features->energy_mean,
-                         frame->features->energy_std);
+                     frame->features->num_coefficients,
+                     frame->features->size());
+            
+            // Check if feature size matches model input
+            if (frame->features->size() != static_cast<size_t>(info.input_size)) {
+                ESP_LOGW(TAG, "Feature size mismatch! Got %d, expected %d",
+                         frame->features->size(), info.input_size);
+                ESP_LOGW(TAG, "Skipping this inference");
+                continue;
             }
             
+            // Run classification
+            ml::ClassificationResult result;
+            ml::ClassifierStatus status = classifier->classify(
+                frame->features->data,
+                result
+            );
+            
+            if (status == ml::ClassifierStatus::OK) {
+                // Log results
+                ESP_LOGI(TAG, "=== Inference Result ===");
+                ESP_LOGI(TAG, "Time: %lu µs (%.2f ms)",
+                         result.inference_time_us,
+                         result.inference_time_us / 1000.0f);
+                ESP_LOGI(TAG, "Predicted: %s (class %d)",
+                         info.class_labels[result.predicted_class].c_str(),
+                         result.predicted_class);
+                ESP_LOGI(TAG, "Confidence: %.2f%%", result.confidence * 100.0f);
+                ESP_LOGI(TAG, "Probabilities:");
+                
+                for (size_t i = 0; i < result.probabilities.size(); ++i) {
+                    ESP_LOGI(TAG, "  [%d] %s: %.2f%%",
+                             i,
+                             info.class_labels[i].c_str(),
+                             result.probabilities[i] * 100.0f);
+                }
+                
+                // Check if it's glass breaking with high confidence
+                if (result.predicted_class == 0 &&  // glass_breaking class
+                    result.confidence > 0.80f) {     // 80% confidence threshold
+                    
+                    ESP_LOGW(TAG, "🚨 GLASS BREAKING DETECTED with %.1f%% confidence!",
+                             result.confidence * 100.0f);
+                    ClassificationFrame class_frame{
+                        .result = std::move(&result),
+                        .timestamp_us = frame->timestamp_us,
+                        .rms_energy = 0.0f  
+                    };
+                    
+                    // TODO: Trigger alert/notification
+                    // - Send to event filter for smoothing
+                    // - Publish to HTTP/MQTT
+                    // - Activate alarm/LED
+                    if (xQueueSend(classification_queue, &class_frame, 0) != pdTRUE) {
+                        ESP_LOGW(TAG, "Classification queue full");
+                    }
+                }
+                
+            } else {
+                ESP_LOGE(TAG, "Classification failed: %d", static_cast<int>(status));
+            }
+            
+            // Log memory status
+            ESP_LOGI(TAG, "Free heap: %lu bytes", esp_get_free_heap_size());
             // Simulate inference time
             vTaskDelay(pdMS_TO_TICKS(100));
             
             // TODO: Send results to event filter and publisher
         }
     }
+    delete classifier;
+    vTaskDelete(NULL);
+}
+
+// ======================== TASK 4: NETWORK PUBLISHER ========================
+
+void publisher_task(void* pvParameters) {
+    ESP_LOGI(TAG, "Publisher task started");
+
+    ClassificationFrame frame;
+    ml::ModelInfo info = ml::ModelInfo();  // Get from classifier if needed
     
+    while (true) {
+        if (xQueueReceive(classification_queue, &frame, portMAX_DELAY) == pdTRUE) {
+
+            if (!publisher->isConnected()) {
+                ESP_LOGW(TAG, "Not connected to WiFi, reconnecting...");
+                if (publisher->connect(30000)) {
+                    ESP_LOGI(TAG, "Reconnected to WiFi");
+                } else {
+                    ESP_LOGE(TAG, "Failed to reconnect");
+                    continue;
+                }
+            }
+
+            // Get label
+            std::string label = class_labels[frame.result->predicted_class];
+
+            // Prepare alternatives
+            std::vector<std::pair<std::string, float>> alternatives;
+            for (size_t i = 0; i < frame.result->probabilities.size(); ++i) {
+                if (i != static_cast<size_t>(frame.result->predicted_class)) {
+                    alternatives.push_back({
+                        class_labels[i],
+                        frame.result->probabilities[i]
+                    });
+                }
+            }
+
+            // Publish event
+            ESP_LOGI(TAG, "Publishing event to server...");
+            
+            net::PublishResult result = publisher->publishSoundEvent(
+                DEVICE_ID,
+                label,
+                frame.result->confidence,
+                alternatives,
+                1000,  // Duration: 1 second window
+                frame.rms_energy
+            );
+
+            if (result.status == net::PublishStatus::OK) {
+                ESP_LOGI(TAG, "✅ Event published successfully (HTTP %d, %lu ms)",
+                         result.http_code, result.duration_ms);
+            } else {
+                ESP_LOGE(TAG, "❌ Failed to publish event: %d", 
+                         static_cast<int>(result.status));
+                
+                // Publish error to server
+                publisher->publishError(
+                    DEVICE_ID,
+                    "HTTP_PUBLISH_FAILED",
+                    "error",
+                    "Failed to publish sound event"
+                );
+            }
+        }
+    }
+
     vTaskDelete(NULL);
 }
 
@@ -418,11 +607,49 @@ void app_main(void)
     // ✅ CREATE QUEUES FIRST!
     audio_queue = xQueueCreate(10, sizeof(AudioFrame));
     feature_queue = xQueueCreate(5, sizeof(FeatureFrame));
+    classification_queue = xQueueCreate(2, sizeof(ClassificationFrame));
 
-    if(!audio_queue || !feature_queue)
+
+    if(!audio_queue || !feature_queue || !classification_queue)
     {
         ESP_LOGE(TAG, "Failed to create queues");
         return;
+    }
+
+    // Initialize WiFi Publisher
+    ESP_LOGI(TAG, "Initializing network publisher...");
+    
+    publisher = net::createHttpPublisher();
+    
+    std::vector<net::WiFiCredentials> credentials = {
+        {WIFI_SSID_HOME, WIFI_PASS_HOME},
+        {WIFI_SSID_SCHOOL, WIFI_PASS_SCHOOL}
+    };
+    
+    net::ServerConfig server_config = {
+        .url = SERVER_URL,
+        .timeout_ms = SERVER_TIMEOUT_MS,
+        .retry_count = SERVER_RETRY,
+        .device_id_header = DEVICE_ID,
+        .device_key = DEVICE_KEY
+    };
+    ESP_LOGI(TAG, "WiFi credentials test:");
+    ESP_LOGI(TAG, "SSID length: %d", strlen(WIFI_SSID_HOME));
+    ESP_LOGI(TAG, "Pass length: %d", strlen(WIFI_PASS_HOME));
+    
+    if (!publisher->init(credentials, server_config)) {
+        ESP_LOGE(TAG, "Failed to initialize publisher");
+        return;
+    }
+
+    // Connect to WiFi
+    ESP_LOGI(TAG, "Connecting to WiFi...");
+    if (!publisher->connect(30000)) {
+        ESP_LOGW(TAG, "Failed to connect to WiFi initially");
+        ESP_LOGW(TAG, "Will retry in background");
+    } else {
+        ESP_LOGI(TAG, "Connected to: %s", publisher->getCurrentSSID().c_str());
+        ESP_LOGI(TAG, "Signal strength: %d dBm", publisher->getRSSI());
     }
 
     hal_audio::AudioSensor* sensor = hal_audio::createI2SAudioSensor();
@@ -478,7 +705,7 @@ void app_main(void)
     xTaskCreatePinnedToCore(
         feature_extraction_task,
         "mfcc_extract",
-        12288,
+        65536,
         NULL,
         6,   // Medium priority
         NULL,
@@ -488,12 +715,23 @@ void app_main(void)
     xTaskCreatePinnedToCore(
         ml_inference_task,
         "ml_inference",
-        16384,
+        32768,
         NULL,
-        3,   // Lower priority
+        5,   // Lower priority
         NULL,
         1
     );
+
+     xTaskCreatePinnedToCore(
+        publisher_task, 
+        "publisher", 
+        8192, 
+        NULL, 
+        3, 
+        NULL, 
+        0
+    );
+
     
     ESP_LOGI(TAG, "Pipeline started successfully!");
     ESP_LOGI(TAG, "Audio → DSP → MFCC → ML → Results");

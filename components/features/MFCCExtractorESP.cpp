@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include "esp_mac.h"
+#include "esp_system.h"
 
 namespace features {
 
@@ -23,7 +25,9 @@ private:
     int num_frames_;
     
     // Mel filterbank
-    std::vector<std::vector<float>> mel_filterbank_;
+    float** mel_filterbank_;
+    int num_mel_bins_;
+    int fft_bins_;
     
     // DCT matrix for MFCC
     std::vector<std::vector<float>> dct_matrix_;
@@ -45,9 +49,22 @@ public:
         , frame_length_samples_(0)
         , frame_stride_samples_(0)
         , num_frames_(0)
+        , mel_filterbank_(nullptr)  // <-- Moved up
+        , num_mel_bins_(0)
+        , fft_bins_(0)
         , have_stats_(false)
+        
     {
         std::memset(&config_, 0, sizeof(config_));
+    }
+    ~MFCCExtractorESP() override {
+        // Cleanup
+        if (mel_filterbank_) {
+            for (int i = 0; i < num_mel_bins_; ++i) {
+                heap_caps_free(mel_filterbank_[i]);
+            }
+            heap_caps_free(mel_filterbank_);
+        }
     }
     
     FeatureStatus init(const FeatureConfig& config) override {
@@ -68,10 +85,15 @@ public:
         
         // Initialize FFT
         fft_helper_ = std::make_unique<FFTHelperESPDSP>(config_.fft_length);
-        power_spectrum_.resize(config_.fft_length / 2 + 1);
+        fft_bins_ = config_.fft_length / 2 + 1;
+        power_spectrum_.resize(fft_bins_);
         
         // Build mel filterbank
-        buildMelFilterbank();
+        if(!buildMelFilterbank()){
+            ESP_LOGE(TAG, "Failed to allocate mel filterbank - out of memory");
+            return FeatureStatus::ERROR_INVALID_CONFIG;
+        }
+        
         mel_energies_.resize(config_.num_mel_bins);
         
         // Build DCT matrix if using MFCC (not log-mel)
@@ -98,6 +120,18 @@ public:
     }
     
     FeatureStatus compute(const std::vector<int16_t>& pcm, FeatureVector& out) override {
+        if (!initialized_) {
+            return FeatureStatus::ERROR_NOT_INITIALIZED;
+        }
+
+        if(pcm.size() < static_cast<size_t>(frame_length_samples_)){
+            ESP_LOGE(TAG, "Insufficient audio data: %d samples (need >= %d)",
+                     pcm.size(), frame_length_samples_);
+            return FeatureStatus::ERROR_INSUFFICIENT_DATA;
+        }
+
+       
+        
         // Convert int16 to float
         std::vector<float> audio(pcm.size());
         for (size_t i = 0; i < pcm.size(); ++i) {
@@ -267,7 +301,7 @@ private:
     }
     
     // Build mel filterbank
-    void buildMelFilterbank() {
+    bool buildMelFilterbank() {
         float low_mel = hzToMel(config_.lower_frequency_hz);
         float high_mel = hzToMel(config_.upper_frequency_hz);
         
@@ -284,36 +318,83 @@ private:
         }
         
         // Convert to FFT bin numbers
-        int fft_bins = config_.fft_length / 2 + 1;
         std::vector<int> bin_points(config_.num_mel_bins + 2);
+        int fft_bins = config_.fft_length / 2 + 1;
         for (int i = 0; i < config_.num_mel_bins + 2; ++i) {
             bin_points[i] = static_cast<int>(
                 (config_.fft_length + 1) * hz_points[i] / config_.sample_rate
             );
         }
         
-        // Build triangular filters
-        mel_filterbank_.resize(config_.num_mel_bins);
-        for (int i = 0; i < config_.num_mel_bins; ++i) {
-            mel_filterbank_[i].resize(fft_bins, 0.0f);
-            
+        
+        //calculate memory needed
+        num_mel_bins_ = config_.num_mel_bins;
+        size_t bytes_per_bin = fft_bins * sizeof(float);
+        size_t total_bytes = bytes_per_bin * num_mel_bins_;
+
+        //allocate mel filterbank
+        mel_filterbank_ = (float**)heap_caps_malloc(num_mel_bins_ * sizeof(float*), MALLOC_CAP_SPIRAM);
+
+        if(!mel_filterbank_){
+            ESP_LOGE(TAG, "Failed to allocate mel filterbank pointers");
+           
+            return false;
+        }
+        for (int i = 0; i < num_mel_bins_; ++i) {
+            mel_filterbank_[i] = (float*)heap_caps_malloc(
+                bytes_per_bin,
+                MALLOC_CAP_SPIRAM
+            );
+        
+            if (!mel_filterbank_[i]) {
+                ESP_LOGE(TAG, "Failed to allocate mel bin %d", i);
+                // Clean up previous allocations
+                for (int j = 0; j < i; ++j) {
+                    heap_caps_free(mel_filterbank_[j]);
+                }
+                heap_caps_free(mel_filterbank_);
+                mel_filterbank_ = nullptr;
+                return false;
+            }
+        
+            // Initialize to zero
+            memset(mel_filterbank_[i], 0, bytes_per_bin);
+        }
+
+        
+        for (int i = 0; i < num_mel_bins_; ++i) {
             int left = bin_points[i];
             int center = bin_points[i + 1];
             int right = bin_points[i + 2];
             
+            // Bounds check
+            if (left < 0) left = 0;
+            if (center >= fft_bins_) center = fft_bins_ - 1;
+            if (right >= fft_bins_) right = fft_bins_;
+            
             // Rising slope
-            for (int j = left; j < center; ++j) {
+            for (int j = left; j < center && j < fft_bins_; ++j) {
                 mel_filterbank_[i][j] = static_cast<float>(j - left) / (center - left);
             }
             
             // Falling slope
-            for (int j = center; j < right; ++j) {
+            for (int j = center; j < right && j < fft_bins_; ++j) {
                 mel_filterbank_[i][j] = static_cast<float>(right - j) / (right - center);
             }
         }
+        //Check memory befire allocation
+        size_t needed_bytes = config_.num_mel_bins * fft_bins * sizeof(float);
+        ESP_LOGI(TAG, "Allocating %.2f KB for mel filterbank",
+                 needed_bytes / 1024.0f);   
+
+        
+        
+        // Build triangular filters
+        
         
         ESP_LOGI(TAG, "Built mel filterbank: %d bins from %.0f to %.0f Hz",
                  config_.num_mel_bins, config_.lower_frequency_hz, config_.upper_frequency_hz);
+        return true;
     }
     
     // Build DCT matrix
@@ -339,13 +420,13 @@ private:
     
     // Apply mel filterbank to power spectrum
     void applyMelFilterbank(const float* power_spectrum, float* mel_energies) {
-        for (int i = 0; i < config_.num_mel_bins; ++i) {
+        for (int i = 0; i < num_mel_bins_; ++i) {
             mel_energies[i] = 0.0f;
-            for (size_t j = 0; j < mel_filterbank_[i].size(); ++j) {
+            for (size_t j = 0; j < fft_bins_; ++j) {
                 mel_energies[i] += power_spectrum[j] * mel_filterbank_[i][j];
             }
         }
-    }
+    }   
     
     // Apply DCT to get MFCC
     void applyDCT(const float* mel_energies, float* mfcc) {

@@ -64,7 +64,7 @@ inline FeatureConfig defaultEnvironmentFeatureConfig() {
         .frame_length_ms = 30,
         .frame_stride_ms = 10,
         .fft_length = 1024,
-        .lower_frequency_hz = 50.0f,
+        .lower_frequency_hz = 00.0f,
         .upper_frequency_hz = 8000.0f,
         .use_log_mel = false,
         .include_delta = false,      // Often not needed for environment

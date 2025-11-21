@@ -260,6 +260,8 @@ public:
             float normalized = sample / 32768.0f;
             sum_squares += normalized * normalized;
         }
+
+        
         
         return std::sqrt(sum_squares / pcm.size());
     }
